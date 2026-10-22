@@ -73,7 +73,7 @@ class TestWeightUpdaterLoraConfig:
             return WeightUpdater(
                 args or Namespace(),
                 [MagicMock()],
-                weights_getter=lambda: {},
+                weights_getter=lambda *, include_base: {},
                 model_name="qwen",
                 quantization_config=None,
                 iterator_factory=lambda *a, **k: MagicMock(),
