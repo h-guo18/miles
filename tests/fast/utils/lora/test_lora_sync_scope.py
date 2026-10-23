@@ -12,6 +12,7 @@ def _args(**overrides):
         offload_rollout=True,
         lora_base_cpu_backup=False,
         check_weight_update_equal=False,
+        lora_train_only=False,
     )
     return SimpleNamespace(**(args | overrides))
 
@@ -23,8 +24,9 @@ def _args(**overrides):
         ({"lora_base_cpu_backup": True}, True, False),
         ({"offload_rollout": False}, True, False),
         ({"lora_base_cpu_backup": True, "check_weight_update_equal": True}, True, True),
+        ({"lora_base_cpu_backup": True, "lora_train_only": True}, True, True),
     ],
-    ids=["released-without-backup", "host-backup", "never-released", "weight-checker"],
+    ids=["released-without-backup", "host-backup", "never-released", "weight-checker", "train-only"],
 )
 def test_the_sync_sends_the_base_exactly_when_the_engines_lose_it(overrides, keeps_base, sends_base):
     """The trainer's host backup and the weight sync both read this decision; they must agree."""
