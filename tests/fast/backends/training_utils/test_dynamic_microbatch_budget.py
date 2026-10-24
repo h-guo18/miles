@@ -22,7 +22,7 @@ def _get_microbatches(monkeypatch, lengths, dp_microbatches, vpp_size=1, group_s
     )
     args = SimpleNamespace(
         use_dynamic_global_batch_size=True,
-        global_batch_size=len(lengths),
+        backend=SimpleNamespace(global_batch_size=len(lengths)),
         use_dynamic_batch_size=True,
         max_tokens_per_gpu=100,
         qkv_format="thd",
