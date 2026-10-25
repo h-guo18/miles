@@ -112,7 +112,6 @@ def _iter_response_chunks(
             logits = logits.to(torch.float16)
 
     if get_parallel_state().cp.size == 1 and args.qkv_format == "thd":
-        # Split once so backward assembles the packed gradient once, not once per sample.
         layout = list(layout)
         split_sizes = []
         previous_end = 0
