@@ -131,18 +131,27 @@ def _official_checkpoint(model_dir: str) -> str:
 
 def _prepare_checkpoint(backend, *, model_dir: str, model_name: str):
     """Convert the official checkpoint into `<model_dir>/<model_name>` unless that conversion finished."""
-    target = Path(model_dir) / model_name
-    with U.exclusive_path_lock(str(target)):
+    layers = _RECIPES[model_name].layers
+    _convert_official_checkpoint(
+        backend,
+        model_dir=model_dir,
+        target=f"{model_dir}/{model_name}",
+        converter_args=f"--layers {layers}" if layers else "",
+    )
+
+
+def _convert_official_checkpoint(backend, *, model_dir: str, target: str, converter_args: str):
+    """Download the official checkpoint and run tools/convert_mimo_v2_to_bf16.py on it into `target`, unless
+    that conversion finished."""
+    with U.exclusive_path_lock(target):
         # The converter writes the index last, so it marks a finished conversion.
-        if not (target / "model.safetensors.index.json").exists():
+        if not (Path(target) / "model.safetensors.index.json").exists():
             source = _official_checkpoint(model_dir)
-            layers = _RECIPES[model_name].layers
-            layer_args = f"--layers {layers}" if layers else ""
             backend.exec_command_cpu(f"mkdir -p {model_dir}")
             backend.exec_command_cpu(f"hf download {_HF_REPO} --local-dir {source}")
             backend.exec_command_gpu(
                 f"python {U.repo_base_dir}/tools/convert_mimo_v2_to_bf16.py "
-                f"--model-dir {source} --save-dir {target} --device cuda {layer_args}"
+                f"--model-dir {source} --save-dir {target} --device cuda {converter_args}"
             )
 
 

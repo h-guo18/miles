@@ -7,18 +7,24 @@ scripts/run_mimo_v2_6_flash.py trains in full; `prepare` runs the same conversio
 
 Multi-LoRA keeps every adapter's accumulated gradients on the training GPUs between calls, so training and
 sampling use separate GPUs, with PP 1 and no offload:
-  mimo26-p4-bf16           4 training GPUs (TP4, EP4) + one TP4 engine on the BF16 base: one 8-GPU node
-  MiMo-V2.6-Flash-RL-bf16  8 training GPUs (TP4, EP8) + four TP2 engines on the official FP8/MXFP4 checkpoint
-                           that `prepare` downloads: two 8-GPU nodes. The engines draft with EAGLE through the
-                           checkpoint's 3 MTP layers (3 steps, top-1, 4 draft tokens). With 4 slots at rank 16, an
-                           8x4096-token forward_backward peaks at about 130 GB per training GPU; 4 slots at rank 32
-                           need --actor-num-gpus 16 --expert-model-parallel-size 16 (three nodes).
+  mimo26-p4-bf16           4 training GPUs (TP4, EP4) + 4 rollout GPUs: one 8-GPU node
+  MiMo-V2.6-Flash-RL-bf16  8 training GPUs (TP4, EP8) + 8 rollout GPUs: two 8-GPU nodes. The engines draft with
+                           EAGLE through the checkpoint's 3 MTP layers (3 steps, top-1, 4 draft tokens). With 4 slots
+                           at rank 16, an 8x4096-token forward_backward peaks at about 130 GB per training GPU; 4
+                           slots at rank 32 need --actor-num-gpus 16 --expert-model-parallel-size 16 (three nodes).
+Adapters reach the engines from disk and the base is never synced, so the engines may serve another precision of
+the checkpoint than the trainer's BF16 (--rollout-precision; the 4-layer partial serves bf16 only):
+  bf16       the trainer's BF16 conversion: one TP8 engine for the full model
+  fp8        FP8 block-quantized throughout, the official checkpoint with its MXFP4 experts cast to FP8 blocks,
+             which `prepare` writes to <model-dir>/MiMo-V2.6-Flash-RL-FP8: two TP4 engines on the Triton MoE
+  fp8-mxfp4  the official checkpoint (FP8 dense, MXFP4 experts): four TP2 engines on the Marlin MoE
 Sampling also needs SGLang LoRA support for MiMo-V2: per-layer qkv widths, a value head narrower than the key
 head, the dense first layer, skipping the vision/audio towers, expert LoRA on the Marlin MXFP4 experts, and the
 MTP draft's fused FP8 qkv below TP 4.
 
 Args:
   --model-name: checkpoint directory under `--model-dir`; selects the layout above.
+  --rollout-precision: bf16, fp8 or fp8-mxfp4, the checkpoint the engines serve (above); `prepare` converts it.
   --actor-num-gpus, --tensor-model-parallel-size, --expert-model-parallel-size: training GPUs and their TP and
       EP; None takes the layout of --model-name. TP must not exceed 4, the global-attention KV head count.
   --n-adapters, --lora-rank, --lora-alpha: adapter slots, their maximum rank (each client picks a rank up to
@@ -34,17 +40,35 @@ The full model spans two nodes: start the ray head on the first, join the other,
 Examples:
   python scripts/run_mimo_v2_6_flash_tinker.py prepare
   python scripts/run_mimo_v2_6_flash_tinker.py serve --n-adapters 4 --lora-rank 32
+  python scripts/run_mimo_v2_6_flash_tinker.py prepare --model-name MiMo-V2.6-Flash-RL-bf16 --rollout-precision fp8
 """
 
 from dataclasses import dataclass, field
 from typing import Literal
 
 import typer
-from scripts.run_mimo_v2_6_flash import _RECIPES, _official_checkpoint, _prepare_checkpoint
+from scripts.run_mimo_v2_6_flash import (
+    _RECIPES,
+    _convert_official_checkpoint,
+    _official_checkpoint,
+    _prepare_checkpoint,
+)
 
 import miles.utils.external_utils.command_utils as U
 
 app = typer.Typer()
+
+
+RolloutPrecision = Literal["bf16", "fp8", "fp8-mxfp4"]
+
+# `prepare` writes the FP8 conversion here, next to the official checkpoint
+_FP8_CHECKPOINT = "MiMo-V2.6-Flash-RL-FP8"
+
+
+@dataclass(frozen=True)
+class _Engines:
+    num_gpus_per_engine: int
+    sglang_mem_fraction_static: float
 
 
 @dataclass(frozen=True)
@@ -54,10 +78,10 @@ class _Layout:
     expert_model_parallel_size: int
     lora_rank: int
     rollout_num_gpus: int
-    rollout_num_gpus_per_engine: int
-    sglang_mem_fraction_static: float
-    # The engines serve the official FP8/MXFP4 checkpoint instead of the trainer's BF16 conversion.
-    official_engine: bool
+    # the engines of each rollout precision the layout serves
+    engines: dict[str, _Engines]
+    # EAGLE drafts through the checkpoint's MTP layers
+    speculative: bool
 
 
 _LAYOUTS = {
@@ -67,11 +91,15 @@ _LAYOUTS = {
         expert_model_parallel_size=8,
         lora_rank=16,
         rollout_num_gpus=8,
-        rollout_num_gpus_per_engine=2,
-        # weights take 82 GB per GPU and 4 rank-16 LoRA slots another 23 GB; the MTP draft shrinks the KV cache
-        # that is left from about 153k to 97k tokens per engine
-        sglang_mem_fraction_static=0.85,
-        official_engine=True,
+        engines={
+            # 620 GB of BF16 weights need TP8 on 141 GB GPUs
+            "bf16": _Engines(num_gpus_per_engine=8, sglang_mem_fraction_static=0.85),
+            "fp8": _Engines(num_gpus_per_engine=4, sglang_mem_fraction_static=0.85),
+            # weights take 82 GB per GPU and 4 rank-16 LoRA slots another 23 GB; the MTP draft shrinks the KV cache
+            # that is left from about 153k to 97k tokens per engine
+            "fp8-mxfp4": _Engines(num_gpus_per_engine=2, sglang_mem_fraction_static=0.85),
+        },
+        speculative=True,
     ),
     "mimo26-p4-bf16": _Layout(
         actor_num_gpus=4,
@@ -79,11 +107,19 @@ _LAYOUTS = {
         expert_model_parallel_size=4,
         lora_rank=32,
         rollout_num_gpus=4,
-        rollout_num_gpus_per_engine=4,
-        sglang_mem_fraction_static=0.6,
-        official_engine=False,
+        engines={"bf16": _Engines(num_gpus_per_engine=4, sglang_mem_fraction_static=0.6)},
+        speculative=False,
     ),
 }
+
+
+def _engine_checkpoint(model_dir: str, model_name: str, precision: RolloutPrecision) -> str:
+    """The checkpoint the engines serve at `precision`; the trainer reads `<model_dir>/<model_name>`."""
+    return {
+        "bf16": f"{model_dir}/{model_name}",
+        "fp8": f"{model_dir}/{_FP8_CHECKPOINT}",
+        "fp8-mxfp4": _official_checkpoint(model_dir),
+    }[precision]
 
 
 def _engine_config(model_path: str, num_gpus: int) -> str:
@@ -102,6 +138,7 @@ def _engine_config(model_path: str, num_gpus: int) -> str:
 class ScriptArgs(U.ExecuteTrainConfig):
     run_id: str = field(default_factory=U.create_run_id)
     model_name: Literal["MiMo-V2.6-Flash-RL-bf16", "mimo26-p4-bf16"] = "mimo26-p4-bf16"
+    rollout_precision: RolloutPrecision = "bf16"
     num_gpus_per_node: int = 8
     # None takes the layout of --model-name.
     actor_num_gpus: int | None = None
@@ -119,6 +156,9 @@ class ScriptArgs(U.ExecuteTrainConfig):
 
     def __post_init__(self):
         layout = _LAYOUTS[self.model_name]
+        assert (
+            self.rollout_precision in layout.engines
+        ), f"{self.model_name} serves --rollout-precision {' or '.join(layout.engines)}, not {self.rollout_precision}"
         self.actor_num_gpus = self.actor_num_gpus or layout.actor_num_gpus
         self.tensor_model_parallel_size = self.tensor_model_parallel_size or layout.tensor_model_parallel_size
         self.expert_model_parallel_size = self.expert_model_parallel_size or layout.expert_model_parallel_size
@@ -134,8 +174,17 @@ class ScriptArgs(U.ExecuteTrainConfig):
 @app.command()
 @U.dataclass_cli
 def prepare(args: ScriptArgs):
-    """Convert the official checkpoint to BF16 under --model-dir. Run once per node before serving."""
-    _prepare_checkpoint(args.create_backend(), model_dir=args.model_dir, model_name=args.model_name)
+    """Convert the official checkpoint to BF16 under --model-dir, and to FP8 for --rollout-precision fp8. Run once
+    per node before serving."""
+    backend = args.create_backend()
+    _prepare_checkpoint(backend, model_dir=args.model_dir, model_name=args.model_name)
+    if args.rollout_precision == "fp8":
+        _convert_official_checkpoint(
+            backend,
+            model_dir=args.model_dir,
+            target=_engine_checkpoint(args.model_dir, args.model_name, "fp8"),
+            converter_args="--fp8-experts",
+        )
 
 
 @app.command()
@@ -144,9 +193,12 @@ def serve(args: ScriptArgs):
     """Serve the Tinker gateway (idles until clients connect)."""
     recipe = _RECIPES[args.model_name]
     layout = _LAYOUTS[args.model_name]
+    engines = layout.engines[args.rollout_precision]
     tp = args.tensor_model_parallel_size
+    hf_checkpoint = f"{args.model_dir}/{args.model_name}"
+    engine_checkpoint = _engine_checkpoint(args.model_dir, args.model_name, args.rollout_precision)
 
-    ckpt_args = f"--hf-checkpoint {args.model_dir}/{args.model_name} --megatron-to-hf-mode bridge "
+    ckpt_args = f"--hf-checkpoint {hf_checkpoint} --megatron-to-hf-mode bridge "
 
     lora_args = (
         f"--lora-rank {args.lora_rank} --lora-alpha {args.lora_alpha} --lora-dropout 0.0 "
@@ -176,15 +228,16 @@ def serve(args: ScriptArgs):
 
     sglang_args = (
         f"--rollout-num-gpus {layout.rollout_num_gpus} "
-        f"--rollout-num-gpus-per-engine {layout.rollout_num_gpus_per_engine} "
+        f"--rollout-num-gpus-per-engine {engines.num_gpus_per_engine} "
         "--sglang-dtype bfloat16 "
-        f"--sglang-mem-fraction-static {layout.sglang_mem_fraction_static} "
+        f"--sglang-mem-fraction-static {engines.sglang_mem_fraction_static} "
         "--sglang-lora-backend triton "
     )
-    if layout.official_engine:
-        engine_config = _engine_config(_official_checkpoint(args.model_dir), layout.rollout_num_gpus)
+    if engine_checkpoint != hf_checkpoint:
+        engine_config = _engine_config(engine_checkpoint, layout.rollout_num_gpus)
         sglang_args += f"--sglang-config {U.encode_pseudo_file(engine_config)} "
-        # one MTP layer of the official checkpoint per draft step
+    if layout.speculative:
+        # one MTP layer of the checkpoint per draft step
         sglang_args += (
             "--sglang-speculative-algorithm EAGLE --sglang-enable-multi-layer-eagle "
             "--sglang-speculative-num-steps 3 --sglang-speculative-eagle-topk 1 "

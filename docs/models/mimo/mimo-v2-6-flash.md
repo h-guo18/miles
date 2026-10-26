@@ -64,11 +64,18 @@ On two 8×H200 nodes with node-local NVMe (4-drive RAID0), a step with 16 sample
 
 `scripts/run_mimo_v2_6_flash_tinker.py` serves [multi-LoRA training](/advanced/lora#multi-lora-training) on the same BF16 conversion: `prepare` converts the checkpoint and `serve` starts the gateway, which clients drive as in the [gateway example](/examples/multi-lora). The adapters cover q/k/v/o, the MLP (dense layer 0 and the routed experts) and `lm_head`.
 
-Multi-LoRA keeps every adapter's gradients on the training GPUs between calls, so training and sampling use separate GPUs, with PP 1 and no offload. The full-model layout trains on TP4 × EP8 (8 GPUs) next to four TP2 engines that serve the official FP8/MXFP4 checkpoint `prepare` downloads, 16 GPUs over two nodes. The engines draft with EAGLE through the checkpoint's 3 MTP layers (3 steps, top-1, 4 draft tokens):
+Multi-LoRA keeps every adapter's gradients on the training GPUs between calls, so training and sampling use separate GPUs, with PP 1 and no offload. The full-model layout trains on TP4 × EP8 (8 GPUs) next to 8 rollout GPUs, 16 GPUs over two nodes, and the engines draft with EAGLE through the checkpoint's 3 MTP layers (3 steps, top-1, 4 draft tokens). `--rollout-precision` picks the checkpoint the engines serve; the 4-layer partial serves `bf16` only:
+
+| `--rollout-precision` | Engine checkpoint | Engines |
+| --- | --- | --- |
+| `bf16` (default) | the trainer's BF16 conversion | one TP8 |
+| `fp8` | blockwise FP8 throughout: the official checkpoint with its MXFP4 experts cast to FP8 blocks, which `prepare --rollout-precision fp8` writes to `<model-dir>/MiMo-V2.6-Flash-RL-FP8` | two TP4, Triton MoE |
+| `fp8-mxfp4` | the official checkpoint (FP8 dense, MXFP4 experts) | four TP2, Marlin MoE |
 
 ```bash
 MILES_SCRIPT_EXTERNAL_RAY=1 MASTER_ADDR=<head ip> python scripts/run_mimo_v2_6_flash_tinker.py serve \
-    --model-name MiMo-V2.6-Flash-RL-bf16 --num-nodes 2 --output-dir <directory both nodes can read>
+    --model-name MiMo-V2.6-Flash-RL-bf16 --rollout-precision fp8-mxfp4 --num-nodes 2 \
+    --output-dir <directory both nodes can read>
 ```
 
 The trainer saves each sampler adapter under `--output-dir` and the engines on the other node load it from there, so the directory must be on storage both nodes share.
