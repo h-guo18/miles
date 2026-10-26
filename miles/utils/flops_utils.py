@@ -102,8 +102,12 @@ def model_flops_from_hf_config(config: Any) -> ModelFlops:
     """Per-layer forward FLOPs of the text model described by an HF config (object or dict)."""
     if isinstance(config, dict):
         config = _AttrDict(config)
-    getter = getattr(config, "get_text_config", None)
-    text = getter() if callable(getter) else getattr(config, "text_config", None)
+    getter = getattr(
+        config, "get_text_config", None
+    )  # config-access-exempt: composite HF configs nest their text model, plain ones do not
+    text = (
+        getter() if callable(getter) else getattr(config, "text_config", None)
+    )  # config-access-exempt: composite HF configs nest their text model, plain ones do not
     config = _AttrDict(text) if isinstance(text, dict) else (text or config)
     lm_head = 2 * config.hidden_size * _first(config, "padded_vocab_size", "vocab_size")
     pattern = _first(config, "hybrid_override_pattern", "layers_block_type")
@@ -123,7 +127,9 @@ class _AttrDict(dict):
 
 def _first(config: Any, *names: str, default: Any = None) -> Any:
     for name in names:
-        value = getattr(config, name, None)
+        value = getattr(
+            config, name, None
+        )  # config-access-exempt: HF model families name the same dimension differently
         if value is not None:
             return value
     return default
@@ -136,7 +142,9 @@ def _known(table: dict[str, Any], name: str, what: str) -> Any:
 
 
 def _field(container: Any, name: str, default: Any = None) -> Any:
-    value = container.get(name) if isinstance(container, dict) else getattr(container, name, None)
+    value = (
+        container.get(name) if isinstance(container, dict) else getattr(container, name, None)
+    )  # config-access-exempt: per-layer HF spec fields are optional and differ across model families
     return default if value is None else value
 
 

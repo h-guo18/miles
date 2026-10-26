@@ -17,6 +17,7 @@ from types import SimpleNamespace
 import pytest
 
 from miles.utils import dp_schedule
+from miles.utils.args.runtime import RolloutConfig, TrainerConfig
 from miles.utils.dp_schedule import TrainParallelConfig, build_dp_schedule
 from miles.utils.flops_utils import KeyTerm, LayerFlops, ModelFlops
 
@@ -28,14 +29,17 @@ def make_args(
     max_tokens_per_gpu=None,
     balance_data=False,
     balance_by_flops=False,
+    allow_partial_train_step=False,
 ):
-    return SimpleNamespace(
+    return RolloutConfig.model_construct(
         micro_batch_size=micro_batch_size,
         use_dynamic_batch_size=use_dynamic_batch_size,
         max_tokens_per_gpu=max_tokens_per_gpu,
         balance_data=balance_data,
         balance_by_flops=balance_by_flops,
         hf_checkpoint="unused",
+        allow_partial_train_step=allow_partial_train_step,
+        train_backend="megatron",
     )
 
 
@@ -292,8 +296,7 @@ def test_partial_final_step_opt_in():
     step of the trailing rollout, covering every sample."""
     rollout_indices = [0, 0, 1, 2, 2, 3, 4, 4]
     total_lengths = [3] * 8
-    args = make_args(use_dynamic_batch_size=True, max_tokens_per_gpu=12)
-    args.allow_partial_train_step = True
+    args = make_args(use_dynamic_batch_size=True, max_tokens_per_gpu=12, allow_partial_train_step=True)
     tp = make_tp(dp_size=1)
 
     partitions, mbi, nmb, num_rollouts_per_step = build_dp_schedule(
@@ -317,8 +320,7 @@ def test_partial_final_step_skipped_when_below_dp_size():
     """A trailing rollout with fewer samples than dp_size cannot form a step."""
     rollout_indices = [0, 0, 1, 1, 2]
     total_lengths = [3] * 5
-    args = make_args(use_dynamic_batch_size=True, max_tokens_per_gpu=12)
-    args.allow_partial_train_step = True
+    args = make_args(use_dynamic_batch_size=True, max_tokens_per_gpu=12, allow_partial_train_step=True)
     tp = make_tp(dp_size=2)
 
     _, _, nmb, num_rollouts_per_step = build_dp_schedule(
@@ -450,3 +452,11 @@ def test_balance_by_flops_balances_by_tokens_when_the_model_cannot_be_sized(monk
         assert dp_schedule._calculate_workloads([3, 1, 2], make_args(balance_by_flops=True)) == [3, 1, 2]
     finally:
         dp_schedule._model_flops.cache_clear()
+
+
+@pytest.mark.parametrize("config_cls", [TrainerConfig, RolloutConfig])
+def test_flops_workloads_size_from_the_hf_checkpoint_of_either_config(quadratic_model_flops, config_cls):
+    """Trainer and rollout scheduling both size workloads from `hf_checkpoint`, not backend model dimensions."""
+    config = config_cls.model_construct(hf_checkpoint="unused")
+
+    assert dp_schedule._calculate_workloads([1, 2, 3], config) == [11.0, 23.0, 36.0]
