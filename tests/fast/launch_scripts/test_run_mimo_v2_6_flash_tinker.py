@@ -31,6 +31,7 @@ def test_full_model_engines_follow_the_rollout_precision(
     assert f"--hf-checkpoint {model_dir}/{FULL_MODEL} " in serve
     assert f"--rollout-num-gpus-per-engine {gpus_per_engine} " in serve
     assert "--sglang-speculative-algorithm EAGLE " in serve
+    assert ("--sglang-moe-runner-backend triton " in serve) == (precision == "fp8")
     if engine_checkpoint is None:
         assert "--sglang-config" not in serve and not recording.pseudo_files
     else:

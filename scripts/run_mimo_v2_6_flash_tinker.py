@@ -242,6 +242,10 @@ def serve(args: ScriptArgs):
     if engine_checkpoint is not None:
         engine_config = _engine_config(engine_checkpoint, layout.rollout_num_gpus)
         sglang_args += f"--sglang-config {U.encode_pseudo_file(engine_config)} "
+    if args.rollout_precision == "fp8":
+        # On SM100 SGLang picks flashinfer_trtllm for FP8 MiMo experts, which has no expert LoRA path; SM90 already
+        # resolves to Triton
+        sglang_args += "--sglang-moe-runner-backend triton "
     if layout.speculative:
         # one MTP layer of the checkpoint per draft step
         sglang_args += (
