@@ -24,7 +24,8 @@ MTP draft's fused FP8 qkv below TP 4.
 
 Args:
   --model-name: checkpoint directory under `--model-dir`; selects the layout above.
-  --rollout-precision: bf16, fp8 or fp8-mxfp4, the checkpoint the engines serve (above); `prepare` converts it.
+  --rollout-precision: bf16, fp8 or fp8-mxfp4, the checkpoint the engines serve (above); `prepare` writes or
+      downloads it.
   --actor-num-gpus, --tensor-model-parallel-size, --expert-model-parallel-size: training GPUs and their TP and
       EP; None takes the layout of --model-name. TP must not exceed 4, the global-attention KV head count.
   --n-adapters, --lora-rank, --lora-alpha: adapter slots, their maximum rank (each client picks a rank up to
@@ -50,6 +51,7 @@ import typer
 from scripts.run_mimo_v2_6_flash import (
     _RECIPES,
     _convert_official_checkpoint,
+    _download_official_checkpoint,
     _official_checkpoint,
     _prepare_checkpoint,
 )
@@ -79,7 +81,7 @@ class _Layout:
     lora_rank: int
     rollout_num_gpus: int
     # the engines of each rollout precision the layout serves
-    engines: dict[str, _Engines]
+    engines: dict[RolloutPrecision, _Engines]
     # EAGLE drafts through the checkpoint's MTP layers
     speculative: bool
 
@@ -113,10 +115,10 @@ _LAYOUTS = {
 }
 
 
-def _engine_checkpoint(model_dir: str, model_name: str, precision: RolloutPrecision) -> str:
-    """The checkpoint the engines serve at `precision`; the trainer reads `<model_dir>/<model_name>`."""
+def _engine_checkpoint(model_dir: str, precision: RolloutPrecision) -> str | None:
+    """The checkpoint the engines serve at `precision`, or None when they serve the trainer's --hf-checkpoint."""
     return {
-        "bf16": f"{model_dir}/{model_name}",
+        "bf16": None,
         "fp8": f"{model_dir}/{_FP8_CHECKPOINT}",
         "fp8-mxfp4": _official_checkpoint(model_dir),
     }[precision]
@@ -166,25 +168,30 @@ class ScriptArgs(U.ExecuteTrainConfig):
 
     @property
     def actor_num_nodes(self) -> int:
-        nodes = max(1, self.actor_num_gpus // self.num_gpus_per_node)
-        assert self.actor_num_gpus % nodes == 0, f"{self.actor_num_gpus} training GPUs do not fill {nodes} nodes"
-        return nodes
+        per_node = self.num_gpus_per_node
+        assert (
+            self.actor_num_gpus <= per_node or self.actor_num_gpus % per_node == 0
+        ), f"{self.actor_num_gpus} training GPUs do not fill whole {per_node}-GPU nodes"
+        return -(-self.actor_num_gpus // per_node)
 
 
 @app.command()
 @U.dataclass_cli
 def prepare(args: ScriptArgs):
-    """Convert the official checkpoint to BF16 under --model-dir, and to FP8 for --rollout-precision fp8. Run once
-    per node before serving."""
+    """Convert the official checkpoint to BF16 under --model-dir, and prepare the checkpoint --rollout-precision
+    serves. Run once per node before serving."""
     backend = args.create_backend()
     _prepare_checkpoint(backend, model_dir=args.model_dir, model_name=args.model_name)
     if args.rollout_precision == "fp8":
         _convert_official_checkpoint(
             backend,
             model_dir=args.model_dir,
-            target=_engine_checkpoint(args.model_dir, args.model_name, "fp8"),
+            target=_engine_checkpoint(args.model_dir, "fp8"),
             converter_args="--fp8-experts",
         )
+    elif args.rollout_precision == "fp8-mxfp4":
+        # the engines serve the download itself, which the BF16 conversion skips once it has finished
+        _download_official_checkpoint(backend, model_dir=args.model_dir)
 
 
 @app.command()
@@ -195,10 +202,9 @@ def serve(args: ScriptArgs):
     layout = _LAYOUTS[args.model_name]
     engines = layout.engines[args.rollout_precision]
     tp = args.tensor_model_parallel_size
-    hf_checkpoint = f"{args.model_dir}/{args.model_name}"
-    engine_checkpoint = _engine_checkpoint(args.model_dir, args.model_name, args.rollout_precision)
+    engine_checkpoint = _engine_checkpoint(args.model_dir, args.rollout_precision)
 
-    ckpt_args = f"--hf-checkpoint {hf_checkpoint} --megatron-to-hf-mode bridge "
+    ckpt_args = f"--hf-checkpoint {args.model_dir}/{args.model_name} --megatron-to-hf-mode bridge "
 
     lora_args = (
         f"--lora-rank {args.lora_rank} --lora-alpha {args.lora_alpha} --lora-dropout 0.0 "
@@ -233,7 +239,7 @@ def serve(args: ScriptArgs):
         f"--sglang-mem-fraction-static {engines.sglang_mem_fraction_static} "
         "--sglang-lora-backend triton "
     )
-    if engine_checkpoint != hf_checkpoint:
+    if engine_checkpoint is not None:
         engine_config = _engine_config(engine_checkpoint, layout.rollout_num_gpus)
         sglang_args += f"--sglang-config {U.encode_pseudo_file(engine_config)} "
     if layout.speculative:

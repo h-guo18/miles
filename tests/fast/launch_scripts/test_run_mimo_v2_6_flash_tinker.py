@@ -44,3 +44,35 @@ def test_partial_model_serves_bf16_only(monkeypatch, precision):
     launcher = import_launch_script(REPO_ROOT / "scripts/run_mimo_v2_6_flash_tinker.py")
     with pytest.raises(AssertionError, match="serves --rollout-precision bf16"):
         launcher.ScriptArgs(model_name="mimo26-p4-bf16", rollout_precision=precision)
+
+
+def test_fp8_mxfp4_prepare_downloads_the_served_checkpoint_after_the_bf16_conversion(monkeypatch, tmp_path):
+    freeze_environment(monkeypatch)
+    recording = install_command_recorder(monkeypatch)
+    launcher = import_launch_script(REPO_ROOT / "scripts/run_mimo_v2_6_flash_tinker.py")
+    model_dir = tmp_path / "models"
+    (model_dir / FULL_MODEL).mkdir(parents=True)
+    (model_dir / FULL_MODEL / "model.safetensors.index.json").write_text("{}")
+
+    launcher.prepare(model_name=FULL_MODEL, rollout_precision="fp8-mxfp4", model_dir=str(model_dir))
+
+    assert not any("convert_mimo_v2_to_bf16.py" in cmd for cmd in recording.commands)
+    assert any(
+        f"hf download XiaomiMiMo/MiMo-V2.6-Flash-RL --local-dir {model_dir}/MiMo-V2.6-Flash-RL" in cmd
+        for cmd in recording.commands
+    )
+
+
+@pytest.mark.parametrize("actor_num_gpus, nodes", [(4, 1), (8, 1), (16, 2)])
+def test_training_gpus_fill_whole_nodes(monkeypatch, actor_num_gpus, nodes):
+    freeze_environment(monkeypatch)
+    launcher = import_launch_script(REPO_ROOT / "scripts/run_mimo_v2_6_flash_tinker.py")
+    assert launcher.ScriptArgs(model_name=FULL_MODEL, actor_num_gpus=actor_num_gpus).actor_num_nodes == nodes
+
+
+def test_training_gpus_that_split_a_node_are_rejected(monkeypatch):
+    freeze_environment(monkeypatch)
+    launcher = import_launch_script(REPO_ROOT / "scripts/run_mimo_v2_6_flash_tinker.py")
+    args = launcher.ScriptArgs(model_name=FULL_MODEL, actor_num_gpus=12)
+    with pytest.raises(AssertionError, match="do not fill whole 8-GPU nodes"):
+        assert args.actor_num_nodes
